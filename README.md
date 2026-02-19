@@ -19,12 +19,15 @@ python3 ebm/main.py \
   --n-trials 100 \
   --epochs 200 \
   --study-name ebm_long_gpu_run \
-  --output-dir runs/optuna
+  --output-dir runs/optuna \
+  --mlflow-tracking-uri file:./runs/mlflow \
+  --mlflow-experiment returns_ebm
 ```
 
 Useful flags:
 
-- `--storage sqlite:///runs/optuna/ebm.db`: persist/resume studies.
+- `--mlflow-tracking-uri file:./runs/mlflow`: set the MLflow backend store.
+- `--mlflow-experiment returns_ebm`: group runs under an MLflow experiment.
 - `--timeout 86400`: stop optimization after a fixed number of seconds.
 - `--train-ratio 0.70 --val-ratio 0.15`: adjust time-based data splits.
 
@@ -37,3 +40,5 @@ Artifacts are written under `runs/optuna/<study-name>/`, including:
 - `trial_XXXX/validation_prediction_diagnostics.png`
 - `trial_XXXX/test_prediction_diagnostics.png`
 - `trial_XXXX/model_state.pt`
+
+All trial metrics, params, and artifacts are also logged to MLflow.

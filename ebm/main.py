@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Dict, Any, Tuple, List
 
 import matplotlib.pyplot as plt
+import mlflow
 import numpy as np
 import optuna
 import pandas as pd
@@ -247,6 +248,19 @@ def save_study_summary(study: optuna.Study, output_dir: Path) -> None:
     (output_dir / "best_trial.json").write_text(json.dumps(best_payload, indent=2))
 
 
+def to_mlflow_params(params: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for key, value in params.items():
+        log_key = f"{prefix}{key}" if prefix else key
+        if isinstance(value, (str, int, float, bool)):
+            out[log_key] = value
+        elif value is None:
+            out[log_key] = "None"
+        else:
+            out[log_key] = json.dumps(value)
+    return out
+
+
 def build_objective(
     train_data: Dict[str, torch.Tensor],
     val_data: Dict[str, torch.Tensor],
@@ -297,88 +311,105 @@ def build_objective(
             activation=params["activation"],
             use_layernorm=params["use_layernorm"],
         )
+        with mlflow.start_run(run_name=f"trial_{trial.number:04d}", nested=True):
+            mlflow.log_param("trial_number", trial.number)
+            mlflow.log_param("optuna_study", trial.study.study_name)
+            mlflow.log_params(to_mlflow_params(trial.params, prefix="optuna."))
+            mlflow.log_params(to_mlflow_params(params, prefix="trial."))
 
-        try:
-            history = train_energy_model(
+            try:
+                history = train_energy_model(
+                    model=model,
+                    train_data=train_data,
+                    val_data=val_data,
+                    n_epochs=n_epochs,
+                    batch_size=params["batch_size"],
+                    lr=params["lr"],
+                    weight_decay=params["weight_decay"],
+                    n_negative_samples=params["n_negative_samples"],
+                    noise_std=params["noise_std"],
+                    reg_weight=params["reg_weight"],
+                    eval_optimization_iterations=params["eval_optimization_iterations"],
+                    eval_optimization_lr=params["eval_optimization_lr"],
+                    device=device,
+                    trial=trial,
+                )
+            except TrialPrunedSignal:
+                mlflow.set_tag("trial_state", "PRUNED")
+                raise optuna.exceptions.TrialPruned()
+
+            history_df = pd.DataFrame(history)
+            history_df.to_csv(trial_dir / "epoch_metrics.csv", index=False)
+            save_training_plots(history_df, trial_dir / "training_curves.png")
+
+            if "val_rmse" not in history_df.columns:
+                raise RuntimeError(
+                    "Validation metrics were not generated during training."
+                )
+
+            best_idx = int(history_df["val_rmse"].idxmin())
+            best_epoch = int(history_df.loc[best_idx, "epoch"])  # type: ignore
+            best_val_rmse = float(history_df.loc[best_idx, "val_rmse"])  # type: ignore
+
+            val_eval = evaluate_model(
                 model=model,
-                train_data=train_data,
-                val_data=val_data,
-                n_epochs=n_epochs,
-                batch_size=params["batch_size"],
-                lr=params["lr"],
-                weight_decay=params["weight_decay"],
-                n_negative_samples=params["n_negative_samples"],
-                noise_std=params["noise_std"],
-                reg_weight=params["reg_weight"],
-                eval_optimization_iterations=params["eval_optimization_iterations"],
-                eval_optimization_lr=params["eval_optimization_lr"],
+                data=val_data,
                 device=device,
-                trial=trial,
+                optimization_iterations=params["eval_optimization_iterations"],
+                optimization_lr=params["eval_optimization_lr"],
+                batch_size=params["batch_size"],
             )
-        except TrialPrunedSignal:
-            raise optuna.exceptions.TrialPruned()
+            test_eval = evaluate_model(
+                model=model,
+                data=test_data,
+                device=device,
+                optimization_iterations=params["eval_optimization_iterations"],
+                optimization_lr=params["eval_optimization_lr"],
+                batch_size=params["batch_size"],
+            )
 
-        history_df = pd.DataFrame(history)
-        history_df.to_csv(trial_dir / "epoch_metrics.csv", index=False)
-        save_training_plots(history_df, trial_dir / "training_curves.png")
+            save_prediction_plots(val_eval, "Validation", trial_dir)
+            save_prediction_plots(test_eval, "Test", trial_dir)
 
-        if "val_rmse" not in history_df.columns:
-            raise RuntimeError("Validation metrics were not generated during training.")
+            model_path = trial_dir / "model_state.pt"
+            torch.save(model.state_dict(), model_path)
 
-        best_idx = int(history_df["val_rmse"].idxmin())
-        best_epoch = int(history_df.loc[best_idx, "epoch"])  # type: ignore
-        best_val_rmse = float(history_df.loc[best_idx, "val_rmse"])  # type: ignore
+            payload = {
+                "trial_number": trial.number,
+                "best_epoch": best_epoch,
+                "best_val_rmse": best_val_rmse,
+                "params": params,
+                "val_metrics": val_eval["metrics"],
+                "test_metrics": test_eval["metrics"],
+            }
+            (trial_dir / "results.json").write_text(json.dumps(payload, indent=2))
 
-        val_eval = evaluate_model(
-            model=model,
-            data=val_data,
-            device=device,
-            optimization_iterations=params["eval_optimization_iterations"],
-            optimization_lr=params["eval_optimization_lr"],
-            batch_size=params["batch_size"],
-        )
-        test_eval = evaluate_model(
-            model=model,
-            data=test_data,
-            device=device,
-            optimization_iterations=params["eval_optimization_iterations"],
-            optimization_lr=params["eval_optimization_lr"],
-            batch_size=params["batch_size"],
-        )
+            save_trial_summary(
+                trial_dir=trial_dir,
+                trial_number=trial.number,
+                params=params,
+                best_epoch=best_epoch,
+                best_val_rmse=best_val_rmse,
+                val_metrics=val_eval["metrics"],
+                test_metrics=test_eval["metrics"],
+            )
 
-        save_prediction_plots(val_eval, "Validation", trial_dir)
-        save_prediction_plots(test_eval, "Test", trial_dir)
+            trial.set_user_attr("trial_dir", str(trial_dir))
+            trial.set_user_attr("best_epoch", best_epoch)
+            trial.set_user_attr("val_rmse", best_val_rmse)
+            for metric_name, metric_value in test_eval["metrics"].items():
+                trial.set_user_attr(f"test_{metric_name}", float(metric_value))
 
-        model_path = trial_dir / "model_state.pt"
-        torch.save(model.state_dict(), model_path)
+            mlflow.log_metric("best_val_rmse", best_val_rmse)
+            mlflow.log_metric("best_epoch", float(best_epoch))
+            for metric_name, metric_value in val_eval["metrics"].items():
+                mlflow.log_metric(f"val_{metric_name}", float(metric_value))
+            for metric_name, metric_value in test_eval["metrics"].items():
+                mlflow.log_metric(f"test_{metric_name}", float(metric_value))
+            mlflow.set_tag("trial_state", "COMPLETE")
+            mlflow.log_artifacts(str(trial_dir), artifact_path="trial_artifacts")
 
-        payload = {
-            "trial_number": trial.number,
-            "best_epoch": best_epoch,
-            "best_val_rmse": best_val_rmse,
-            "params": params,
-            "val_metrics": val_eval["metrics"],
-            "test_metrics": test_eval["metrics"],
-        }
-        (trial_dir / "results.json").write_text(json.dumps(payload, indent=2))
-
-        save_trial_summary(
-            trial_dir=trial_dir,
-            trial_number=trial.number,
-            params=params,
-            best_epoch=best_epoch,
-            best_val_rmse=best_val_rmse,
-            val_metrics=val_eval["metrics"],
-            test_metrics=test_eval["metrics"],
-        )
-
-        trial.set_user_attr("trial_dir", str(trial_dir))
-        trial.set_user_attr("best_epoch", best_epoch)
-        trial.set_user_attr("val_rmse", best_val_rmse)
-        for metric_name, metric_value in test_eval["metrics"].items():
-            trial.set_user_attr(f"test_{metric_name}", float(metric_value))
-
-        return best_val_rmse
+            return best_val_rmse
 
     return objective
 
@@ -395,9 +426,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-ratio", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--study-name", type=str, default="ebm_hpo")
-    parser.add_argument("--storage", type=str, default=None)
     parser.add_argument("--timeout", type=int, default=None)
     parser.add_argument("--output-dir", type=str, default="runs/optuna")
+    parser.add_argument("--mlflow-tracking-uri", type=str, default="file:./runs/mlflow")
+    parser.add_argument("--mlflow-experiment", type=str, default="returns_ebm")
     parser.add_argument(
         "--device", type=str, default="auto", choices=["auto", "cuda", "cpu"]
     )
@@ -449,6 +481,9 @@ def main() -> None:
     run_config["timestamp_utc"] = datetime.utcnow().isoformat()
     (output_dir / "run_config.json").write_text(json.dumps(run_config, indent=2))
 
+    mlflow.set_tracking_uri(args.mlflow_tracking_uri)
+    mlflow.set_experiment(args.mlflow_experiment)
+
     sampler = optuna.samplers.TPESampler(seed=args.seed)
     pruner = optuna.pruners.MedianPruner(n_warmup_steps=10)
     study = optuna.create_study(
@@ -456,8 +491,6 @@ def main() -> None:
         direction="minimize",
         sampler=sampler,
         pruner=pruner,
-        storage=args.storage,
-        load_if_exists=True,
     )
 
     objective = build_objective(
@@ -471,24 +504,32 @@ def main() -> None:
         output_dir=output_dir,
     )
 
-    print(
-        f"Starting Optuna optimization | trials={args.n_trials}, "
-        f"epochs_per_trial={args.epochs}"
-    )
-    study.optimize(
-        objective,
-        n_trials=args.n_trials,
-        timeout=args.timeout,
-        gc_after_trial=True,
-        show_progress_bar=False,
-    )
+    with mlflow.start_run(run_name=args.study_name):
+        mlflow.log_params(to_mlflow_params(run_config, prefix="run."))
 
-    save_study_summary(study, output_dir)
-    print("Optimization complete.")
-    print(f"Best trial: {study.best_trial.number}")
-    print(f"Best validation RMSE: {study.best_trial.value:.6f}")
-    print(f"Best params: {study.best_trial.params}")
-    print(f"Artifacts saved under: {output_dir}")
+        print(
+            f"Starting Optuna optimization | trials={args.n_trials}, "
+            f"epochs_per_trial={args.epochs}"
+        )
+        study.optimize(
+            objective,
+            n_trials=args.n_trials,
+            timeout=args.timeout,
+            gc_after_trial=True,
+            show_progress_bar=False,
+        )
+
+        save_study_summary(study, output_dir)
+        mlflow.log_metric("best_trial_number", float(study.best_trial.number))
+        mlflow.log_metric("best_validation_rmse", float(study.best_trial.value))  # type: ignore
+        mlflow.log_params(to_mlflow_params(study.best_trial.params, prefix="best."))
+        mlflow.log_artifacts(str(output_dir), artifact_path="study_artifacts")
+
+        print("Optimization complete.")
+        print(f"Best trial: {study.best_trial.number}")
+        print(f"Best validation RMSE: {study.best_trial.value:.6f}")
+        print(f"Best params: {study.best_trial.params}")
+        print(f"Artifacts saved under: {output_dir}")
 
 
 if __name__ == "__main__":
