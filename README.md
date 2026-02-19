@@ -2,6 +2,10 @@
 
 Energy-based model (EBM) prototype for ETF return forecasting with macro features.
 
+## Documentation
+
+- `docs/training_pipeline.md`: training pipeline walkthrough, model description, and guidance for interpreting metrics/plots/artifacts.
+
 ## Sources
 
 The code in `ebm/main.py` loads data exclusively from local CSVs via `DataLoader`:
