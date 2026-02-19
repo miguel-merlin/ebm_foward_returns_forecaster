@@ -104,7 +104,9 @@ def save_training_plots(history_df: pd.DataFrame, output_path: Path) -> None:
     plt.close(fig)
 
 
-def save_prediction_plots(eval_out: Dict[str, Any], split_name: str, out_dir: Path) -> None:
+def save_prediction_plots(
+    eval_out: Dict[str, Any], split_name: str, out_dir: Path
+) -> None:
     y_true = eval_out["y_true"]
     y_pred = eval_out["y_pred"]
     residuals = eval_out["residuals"]
@@ -196,10 +198,10 @@ def save_study_summary(study: optuna.Study, output_dir: Path) -> None:
     ordered = sorted(completed, key=lambda t: t.number)
     trial_ids = [t.number for t in ordered]
     values = [t.value for t in ordered]
-    best_so_far = np.minimum.accumulate(values)
+    best_so_far = np.minimum.accumulate(values)  # type: ignore
 
     fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(trial_ids, values, marker="o", linestyle="-", alpha=0.7, label="val_rmse")
+    ax.plot(trial_ids, values, marker="o", linestyle="-", alpha=0.7, label="val_rmse")  # type: ignore
     ax.plot(
         trial_ids,
         best_so_far,
@@ -273,7 +275,9 @@ def build_objective(
             "use_layernorm": trial.suggest_categorical("use_layernorm", [True, False]),
             "lr": trial.suggest_float("lr", 1e-5, 5e-3, log=True),
             "weight_decay": trial.suggest_float("weight_decay", 1e-7, 1e-3, log=True),
-            "batch_size": trial.suggest_categorical("batch_size", [128, 256, 512, 1024]),
+            "batch_size": trial.suggest_categorical(
+                "batch_size", [128, 256, 512, 1024]
+            ),
             "n_negative_samples": trial.suggest_int("n_negative_samples", 5, 24),
             "noise_std": trial.suggest_float("noise_std", 0.01, 0.2),
             "reg_weight": trial.suggest_float("reg_weight", 1e-4, 1e-1, log=True),
@@ -322,8 +326,8 @@ def build_objective(
             raise RuntimeError("Validation metrics were not generated during training.")
 
         best_idx = int(history_df["val_rmse"].idxmin())
-        best_epoch = int(history_df.loc[best_idx, "epoch"])
-        best_val_rmse = float(history_df.loc[best_idx, "val_rmse"])
+        best_epoch = int(history_df.loc[best_idx, "epoch"])  # type: ignore
+        best_val_rmse = float(history_df.loc[best_idx, "val_rmse"])  # type: ignore
 
         val_eval = evaluate_model(
             model=model,
@@ -394,7 +398,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--storage", type=str, default=None)
     parser.add_argument("--timeout", type=int, default=None)
     parser.add_argument("--output-dir", type=str, default="runs/optuna")
-    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
+    parser.add_argument(
+        "--device", type=str, default="auto", choices=["auto", "cuda", "cpu"]
+    )
     return parser.parse_args()
 
 
