@@ -1,7 +1,13 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from typing import Dict, Tuple, List
+import numpy as np
+from typing import Dict, Tuple, List, Any
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+
+class TrialPrunedSignal(Exception):
+    """Internal signal used to propagate pruning from the training loop."""
 
 
 class FinancialEnergyModel(nn.Module):
@@ -16,6 +22,8 @@ class FinancialEnergyModel(nn.Module):
         n_macro_features: int = 10,
         hidden_dims: List[int] = [256, 128, 64],
         dropout: float = 0.1,
+        activation: str = "relu",
+        use_layernorm: bool = True,
     ):
         super().__init__()
 
@@ -29,14 +37,11 @@ class FinancialEnergyModel(nn.Module):
         prev_dim = input_dim
 
         for hidden_dim in hidden_dims:
-            layers.extend(
-                [
-                    nn.Linear(prev_dim, hidden_dim),
-                    nn.LayerNorm(hidden_dim),
-                    nn.ReLU(),
-                    nn.Dropout(dropout),
-                ]
-            )
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            if use_layernorm:
+                layers.append(nn.LayerNorm(hidden_dim))
+            layers.append(_build_activation(activation))
+            layers.append(nn.Dropout(dropout))
             prev_dim = hidden_dim
 
         layers.append(nn.Linear(prev_dim, 1))
@@ -77,6 +82,19 @@ class FinancialEnergyModel(nn.Module):
 
         energy = self.energy_net(x)
         return energy
+
+
+def _build_activation(name: str) -> nn.Module:
+    activation = name.lower()
+    if activation == "relu":
+        return nn.ReLU()
+    if activation == "gelu":
+        return nn.GELU()
+    if activation == "silu":
+        return nn.SiLU()
+    if activation == "elu":
+        return nn.ELU()
+    raise ValueError(f"Unsupported activation '{name}'")
 
 
 class EnergyOptimizer:
@@ -125,11 +143,11 @@ class EnergyOptimizer:
         forward_pred = torch.randn(
             batch_size, 1, requires_grad=True, device=self.device
         )
-        confidence = torch.abs(
-            torch.randn(batch_size, 1, requires_grad=True, device=self.device)
+        confidence_raw = torch.randn(
+            batch_size, 1, requires_grad=True, device=self.device
         )
 
-        optimizer = optim.Adam([forward_pred, confidence], lr=lr)
+        optimizer = optim.Adam([forward_pred, confidence_raw], lr=lr)
 
         self.model.eval()
         with torch.enable_grad():
@@ -141,7 +159,7 @@ class EnergyOptimizer:
                     current_price,
                     macro_factors,
                     forward_pred,
-                    torch.abs(confidence),
+                    torch.abs(confidence_raw),
                 )
 
                 loss = energy.mean()
@@ -152,7 +170,7 @@ class EnergyOptimizer:
 
         return (
             forward_pred.detach(),
-            torch.abs(confidence.detach()),
+            torch.abs(confidence_raw.detach()),
             final_energy.mean().item(),
         )
 
@@ -162,6 +180,7 @@ def contrastive_divergence_loss(
     data: Dict[str, torch.Tensor],
     n_negative_samples: int = 10,
     noise_std: float = 0.05,
+    reg_weight: float = 0.01,
 ) -> torch.Tensor:
     """
     Contrastive Divergence loss for training the energy model
@@ -205,29 +224,150 @@ def contrastive_divergence_loss(
     loss = positive_energy.mean() - negative_energy.mean()
 
     # Add regularization to prevent energy from becoming arbitrarily negative
-    loss += 0.01 * (positive_energy**2).mean()
+    loss += reg_weight * (positive_energy**2).mean()
 
     return loss
+
+
+def optimize_predictions_in_batches(
+    model: FinancialEnergyModel,
+    data: Dict[str, torch.Tensor],
+    device: str,
+    optimization_iterations: int = 50,
+    optimization_lr: float = 0.01,
+    batch_size: int = 256,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Run energy minimization over a dataset and return predictions, CIs, and energies."""
+    model.eval()
+    optimizer_helper = EnergyOptimizer(model, device=device)
+
+    y_pred_batches = []
+    ci_batches = []
+    pred_energy_batches = []
+    true_energy_batches = []
+
+    n_samples = data["past_prices"].shape[0]
+    with torch.no_grad():
+        for i in range(0, n_samples, batch_size):
+            batch_slice = slice(i, i + batch_size)
+            past = data["past_prices"][batch_slice].to(device)
+            current = data["current_prices"][batch_slice].to(device)
+            macro = data["macro_factors"][batch_slice].to(device)
+            actual = data["actual_returns"][batch_slice].to(device)
+
+            pred_returns, pred_ci, _ = optimizer_helper.optimize_predictions(
+                past_prices=past,
+                current_price=current,
+                macro_factors=macro,
+                n_iterations=optimization_iterations,
+                lr=optimization_lr,
+            )
+
+            pred_energy = model(past, current, macro, pred_returns, pred_ci)
+            true_ci = torch.full_like(actual, 0.02)
+            true_energy = model(past, current, macro, actual, true_ci)
+
+            y_pred_batches.append(pred_returns.detach().cpu().numpy())
+            ci_batches.append(pred_ci.detach().cpu().numpy())
+            pred_energy_batches.append(pred_energy.detach().cpu().numpy())
+            true_energy_batches.append(true_energy.detach().cpu().numpy())
+
+    return (
+        np.vstack(y_pred_batches).reshape(-1),
+        np.vstack(ci_batches).reshape(-1),
+        np.vstack(pred_energy_batches).reshape(-1),
+        np.vstack(true_energy_batches).reshape(-1),
+    )
+
+
+def evaluate_model(
+    model: FinancialEnergyModel,
+    data: Dict[str, torch.Tensor],
+    device: str,
+    optimization_iterations: int = 50,
+    optimization_lr: float = 0.01,
+    batch_size: int = 256,
+) -> Dict[str, Any]:
+    """Compute prediction/energy metrics for a dataset."""
+    y_true = data["actual_returns"].detach().cpu().numpy().reshape(-1)
+    y_pred, y_ci, pred_energy, true_energy = optimize_predictions_in_batches(
+        model=model,
+        data=data,
+        device=device,
+        optimization_iterations=optimization_iterations,
+        optimization_lr=optimization_lr,
+        batch_size=batch_size,
+    )
+
+    residuals = y_true - y_pred
+    mse = mean_squared_error(y_true, y_pred)
+    rmse = float(np.sqrt(mse))
+    mae = mean_absolute_error(y_true, y_pred)
+    r2 = r2_score(y_true, y_pred)
+    denom = np.maximum(np.abs(y_true), 1e-6)
+    mape = float(np.mean(np.abs(residuals) / denom))
+    direction_acc = float((np.sign(y_true) == np.sign(y_pred)).mean())
+
+    if np.std(y_true) < 1e-12 or np.std(y_pred) < 1e-12:
+        corr = 0.0
+    else:
+        corr = float(np.corrcoef(y_true, y_pred)[0, 1])
+
+    metrics = {
+        "mae": float(mae),
+        "mse": float(mse),
+        "rmse": float(rmse),
+        "r2": float(r2),
+        "mape": mape,
+        "directional_accuracy": direction_acc,
+        "correlation": corr,
+        "pred_energy_mean": float(np.mean(pred_energy)),
+        "true_energy_mean": float(np.mean(true_energy)),
+        "energy_gap": float(np.mean(pred_energy - true_energy)),
+        "pred_ci_mean": float(np.mean(y_ci)),
+        "pred_ci_std": float(np.std(y_ci)),
+    }
+
+    return {
+        "metrics": metrics,
+        "y_true": y_true,
+        "y_pred": y_pred,
+        "residuals": residuals,
+        "y_ci": y_ci,
+        "pred_energy": pred_energy,
+        "true_energy": true_energy,
+    }
 
 
 def train_energy_model(
     model: FinancialEnergyModel,
     train_data: Dict[str, torch.Tensor],
+    val_data: Dict[str, torch.Tensor] = {},
     n_epochs: int = 100,
     batch_size: int = 256,
     lr: float = 1e-4,
+    weight_decay: float = 1e-5,
+    n_negative_samples: int = 10,
+    noise_std: float = 0.05,
+    reg_weight: float = 0.01,
+    eval_optimization_iterations: int = 50,
+    eval_optimization_lr: float = 0.01,
     device: str = "cuda",
-):
-    """Train the energy-based model"""
+    trial: Any = None,
+) -> List[Dict[str, float]]:
+    """Train the energy-based model and return per-epoch metrics."""
 
     model = model.to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
 
-    for key in train_data:
-        train_data[key] = train_data[key].to(device)
+    train_data_device = {key: val.to(device) for key, val in train_data.items()}
+    val_data_device = (
+        {key: val.to(device) for key, val in val_data.items()} if val_data else None
+    )
 
-    n_samples = train_data["past_prices"].shape[0]
+    n_samples = train_data_device["past_prices"].shape[0]
+    history: List[Dict[str, float]] = []
 
     for epoch in range(n_epochs):
         model.train()
@@ -239,10 +379,18 @@ def train_energy_model(
         for i in range(0, n_samples, batch_size):
             batch_indices = indices[i : i + batch_size]
 
-            batch_data = {key: val[batch_indices] for key, val in train_data.items()}
+            batch_data = {
+                key: val[batch_indices] for key, val in train_data_device.items()
+            }
 
             optimizer.zero_grad()
-            loss = contrastive_divergence_loss(model, batch_data)
+            loss = contrastive_divergence_loss(
+                model,
+                batch_data,
+                n_negative_samples=n_negative_samples,
+                noise_std=noise_std,
+                reg_weight=reg_weight,
+            )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
@@ -255,7 +403,33 @@ def train_energy_model(
 
         avg_loss = epoch_loss / n_batches
 
-        if (epoch + 1) % 10 == 0:
-            print(
-                f"Epoch {epoch+1}/{n_epochs}, Loss: {avg_loss:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}"
+        epoch_result = {
+            "epoch": float(epoch + 1),
+            "train_loss": float(avg_loss),
+            "lr": float(scheduler.get_last_lr()[0]),
+        }
+
+        if val_data_device:
+            eval_out = evaluate_model(
+                model=model,
+                data=val_data_device,
+                device=device,
+                optimization_iterations=eval_optimization_iterations,
+                optimization_lr=eval_optimization_lr,
+                batch_size=batch_size,
             )
+            for metric_name, metric_val in eval_out["metrics"].items():
+                epoch_result[f"val_{metric_name}"] = float(metric_val)
+
+            if trial is not None:
+                trial.report(eval_out["metrics"]["rmse"], step=epoch + 1)
+                if trial.should_prune():
+                    raise TrialPrunedSignal()
+
+        history.append(epoch_result)
+
+        print(
+            f"Epoch {epoch+1}/{n_epochs} | Loss: {avg_loss:.4f} | LR: {scheduler.get_last_lr()[0]:.6f}"
+        )
+
+    return history
