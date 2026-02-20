@@ -72,7 +72,11 @@ class DataLoader:
         etf_aligned = etf_data.loc[common_dates]
         macro_aligned = macro_data.loc[common_dates]
 
-        etf_returns = etf_aligned.pct_change().fillna(0)
+        etf_returns = (
+            etf_aligned.pct_change()
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(0.0)
+        )
         macro_clean = macro_aligned.ffill().bfill()
         macro_std = macro_clean.std(ddof=0).replace(0, 1.0)
         macro_normalized = (macro_clean - macro_clean.mean()) / macro_std
