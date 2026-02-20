@@ -6,3 +6,4 @@ optuna==4.5.0
 scikit-learn==1.7.2
 mlflow==3.9.0
 psycopg2-binary==2.9.10
+tqdm==4.67.1

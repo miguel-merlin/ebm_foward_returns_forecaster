@@ -4,6 +4,7 @@ import torch.optim as optim
 import numpy as np
 from typing import Dict, Tuple, List, Any
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from tqdm.auto import tqdm
 
 
 class TrialPrunedSignal(Exception):
@@ -369,7 +370,13 @@ def train_energy_model(
     n_samples = train_data_device["past_prices"].shape[0]
     history: List[Dict[str, float]] = []
 
-    for epoch in range(n_epochs):
+    epoch_desc = (
+        f"Trial {trial.number:04d} epochs"
+        if trial is not None and hasattr(trial, "number")
+        else "Training epochs"
+    )
+    epoch_pbar = tqdm(range(n_epochs), desc=epoch_desc, unit="epoch", leave=False)
+    for epoch in epoch_pbar:
         model.train()
         epoch_loss = 0.0
         n_batches = 0
@@ -428,18 +435,13 @@ def train_energy_model(
 
         history.append(epoch_result)
 
+        tqdm_postfix = {
+            "loss": f"{avg_loss:.4f}",
+            "lr": f"{scheduler.get_last_lr()[0]:.6f}",
+        }
         val_rmse = epoch_result.get("val_rmse")
-        val_mae = epoch_result.get("val_mae")
-        if val_rmse is not None and val_mae is not None:
-            print(
-                f"Epoch {epoch+1}/{n_epochs} | train_loss={avg_loss:.4f} "
-                f"| val_rmse={val_rmse:.6f} | val_mae={val_mae:.6f} "
-                f"| lr={scheduler.get_last_lr()[0]:.6f}"
-            )
-        else:
-            print(
-                f"Epoch {epoch+1}/{n_epochs} | train_loss={avg_loss:.4f} "
-                f"| lr={scheduler.get_last_lr()[0]:.6f}"
-            )
+        if val_rmse is not None:
+            tqdm_postfix["val_rmse"] = f"{val_rmse:.6f}"
+        epoch_pbar.set_postfix(tqdm_postfix)
 
     return history

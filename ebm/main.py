@@ -8,6 +8,7 @@ import mlflow
 import optuna
 import pandas as pd
 import torch
+from tqdm.auto import tqdm
 
 from loader import DataLoader
 from model import (
@@ -229,23 +230,37 @@ def main() -> None:
 
     print(f"Using device: {device}")
     print("Loading data...")
-    loader = DataLoader()
-    etf_data = loader.load_etf_data()
-    macro_data = loader.load_macro_data()
-    dataset = loader.prepare_training_data(
-        etf_data=etf_data,
-        macro_data=macro_data,
-        lookback=args.lookback,
-        forward_horizon=args.forward_horizon,
-    )
+    with tqdm(total=5, desc="Data pipeline", unit="step") as data_pbar:
+        loader = DataLoader()
+        data_pbar.set_postfix({"stage": "init_loader"})
+        data_pbar.update(1)
 
-    n_assets = etf_data.shape[1]
-    train_data, val_data, test_data = split_data_by_time(
-        data=dataset,
-        n_assets=n_assets,
-        train_ratio=args.train_ratio,
-        val_ratio=args.val_ratio,
-    )
+        etf_data = loader.load_etf_data()
+        data_pbar.set_postfix({"stage": "load_etf"})
+        data_pbar.update(1)
+
+        macro_data = loader.load_macro_data()
+        data_pbar.set_postfix({"stage": "load_macro"})
+        data_pbar.update(1)
+
+        dataset = loader.prepare_training_data(
+            etf_data=etf_data,
+            macro_data=macro_data,
+            lookback=args.lookback,
+            forward_horizon=args.forward_horizon,
+        )
+        data_pbar.set_postfix({"stage": "prepare_dataset"})
+        data_pbar.update(1)
+
+        n_assets = etf_data.shape[1]
+        train_data, val_data, test_data = split_data_by_time(
+            data=dataset,
+            n_assets=n_assets,
+            train_ratio=args.train_ratio,
+            val_ratio=args.val_ratio,
+        )
+        data_pbar.set_postfix({"stage": "split_data"})
+        data_pbar.update(1)
 
     print(
         f"Samples -> train: {train_data['past_prices'].shape[0]}, "
@@ -270,7 +285,11 @@ def main() -> None:
     if args.mlflow_tracking_uri.startswith("sqlite:///"):
         raw_path = args.mlflow_tracking_uri[len("sqlite:///") :]
         if raw_path:
-            db_path = Path(f"/{raw_path}") if args.mlflow_tracking_uri.startswith("sqlite:////") else Path(raw_path)
+            db_path = (
+                Path(f"/{raw_path}")
+                if args.mlflow_tracking_uri.startswith("sqlite:////")
+                else Path(raw_path)
+            )
             db_path.parent.mkdir(parents=True, exist_ok=True)
 
     mlflow.set_tracking_uri(args.mlflow_tracking_uri)
@@ -313,13 +332,32 @@ def main() -> None:
             f"Starting Optuna optimization | trials={args.n_trials}, "
             f"epochs_per_trial={args.epochs}"
         )
-        study.optimize(
-            objective,
-            n_trials=args.n_trials,
-            timeout=args.timeout,
-            gc_after_trial=True,
-            show_progress_bar=False,
-        )
+        with tqdm(
+            total=args.n_trials, desc="Optuna trials", unit="trial"
+        ) as trial_pbar:
+
+            def _optuna_tqdm_callback(
+                callback_study: optuna.Study, callback_trial: optuna.Trial
+            ) -> None:
+                trial_pbar.update(1)
+                postfix = {"last_state": callback_trial.state.name}  # type: ignore
+                try:
+                    best_trial = callback_study.best_trial
+                except ValueError:
+                    best_trial = None
+                if best_trial is not None:
+                    postfix["best_rmse"] = f"{float(best_trial.value):.6f}"  # type: ignore
+                    postfix["best_trial"] = best_trial.number
+                trial_pbar.set_postfix(postfix)
+
+            study.optimize(
+                objective,
+                n_trials=args.n_trials,
+                timeout=args.timeout,
+                gc_after_trial=True,
+                show_progress_bar=False,
+                callbacks=[_optuna_tqdm_callback],  # type: ignore
+            )
 
         save_study_summary(study, output_dir)
         mlflow.log_metric("best_trial_number", float(study.best_trial.number))
