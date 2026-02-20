@@ -1,5 +1,6 @@
 import argparse
 import json
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict
@@ -231,27 +232,46 @@ def main() -> None:
     print(f"Using device: {device}")
     print("Loading data...")
     with tqdm(total=5, desc="Data pipeline", unit="step") as data_pbar:
-        loader = DataLoader()
         data_pbar.set_postfix({"stage": "init_loader"})
+        stage_start = time.perf_counter()
+        loader = DataLoader()
+        print(
+            f"[data] init_loader completed in {time.perf_counter() - stage_start:.2f}s"
+        )
         data_pbar.update(1)
 
-        etf_data = loader.load_etf_data()
         data_pbar.set_postfix({"stage": "load_etf"})
+        stage_start = time.perf_counter()
+        etf_data = loader.load_etf_data()
+        print(
+            f"[data] load_etf completed in {time.perf_counter() - stage_start:.2f}s"
+        )
         data_pbar.update(1)
 
-        macro_data = loader.load_macro_data()
         data_pbar.set_postfix({"stage": "load_macro"})
+        stage_start = time.perf_counter()
+        macro_data = loader.load_macro_data()
+        print(
+            f"[data] load_macro completed in {time.perf_counter() - stage_start:.2f}s"
+        )
         data_pbar.update(1)
 
+        data_pbar.set_postfix({"stage": "prepare_dataset"})
+        stage_start = time.perf_counter()
         dataset = loader.prepare_training_data(
             etf_data=etf_data,
             macro_data=macro_data,
             lookback=args.lookback,
             forward_horizon=args.forward_horizon,
         )
-        data_pbar.set_postfix({"stage": "prepare_dataset"})
+        print(
+            "[data] prepare_dataset completed in "
+            f"{time.perf_counter() - stage_start:.2f}s"
+        )
         data_pbar.update(1)
 
+        data_pbar.set_postfix({"stage": "split_data"})
+        stage_start = time.perf_counter()
         n_assets = etf_data.shape[1]
         train_data, val_data, test_data = split_data_by_time(
             data=dataset,
@@ -259,7 +279,9 @@ def main() -> None:
             train_ratio=args.train_ratio,
             val_ratio=args.val_ratio,
         )
-        data_pbar.set_postfix({"stage": "split_data"})
+        print(
+            f"[data] split_data completed in {time.perf_counter() - stage_start:.2f}s"
+        )
         data_pbar.update(1)
 
     print(

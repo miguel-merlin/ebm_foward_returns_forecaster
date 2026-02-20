@@ -80,28 +80,44 @@ class DataLoader:
             macro_normalized.replace([np.inf, -np.inf], np.nan).fillna(0.0)
         )
 
-        past_prices_list = []
-        current_prices_list = []
-        macro_list = []
-        actual_returns_list = []
+        etf_values = np.ascontiguousarray(etf_returns.to_numpy(dtype=np.float64))
+        macro_values = np.ascontiguousarray(macro_normalized.to_numpy(dtype=np.float64))
 
-        for i in range(lookback, len(etf_aligned) - forward_horizon):
-            for col in etf_returns.columns:
-                past = etf_returns[col].iloc[i - lookback : i].values
-                current = np.array([etf_returns[col].iloc[i]])
-                macro = macro_normalized.iloc[i].values
-                actual_return = etf_returns[col].iloc[i : i + forward_horizon].sum()
+        n_timesteps, n_assets = etf_values.shape
+        n_samples_per_asset = n_timesteps - lookback - forward_horizon
+        if n_samples_per_asset <= 0:
+            raise ValueError(
+                "Not enough overlapping data to build samples. "
+                f"Need more than lookback + forward_horizon ({lookback + forward_horizon}) "
+                f"timesteps, got {n_timesteps}."
+            )
 
-                past_prices_list.append(past)
-                current_prices_list.append(current)
-                macro_list.append(macro)
-                actual_returns_list.append(actual_return)
+        # Build lookback windows for every asset at every valid timestep.
+        # Shape: (n_samples_per_asset, n_assets, lookback)
+        past_windows = np.lib.stride_tricks.sliding_window_view(
+            etf_values, window_shape=lookback, axis=0
+        )[:n_samples_per_asset]
+        past_prices = np.ascontiguousarray(past_windows.reshape(-1, lookback))
+
+        # Current returns at timestep i for each asset.
+        # Shape before reshape: (n_samples_per_asset, n_assets)
+        current_slice = etf_values[lookback : n_timesteps - forward_horizon]
+        current_prices = np.ascontiguousarray(current_slice.reshape(-1, 1))
+
+        # Macro factors at timestep i, repeated once per asset to preserve order:
+        # i-major, then asset-major.
+        macro_slice = macro_values[lookback : n_timesteps - forward_horizon]
+        macro_factors = np.ascontiguousarray(np.repeat(macro_slice, n_assets, axis=0))
+
+        # Forward return is sum of returns in [i, i + forward_horizon).
+        cumsum = np.vstack([np.zeros((1, n_assets)), np.cumsum(etf_values, axis=0)])
+        start = np.arange(lookback, n_timesteps - forward_horizon)
+        forward_sum = cumsum[start + forward_horizon] - cumsum[start]
+        actual_returns = np.ascontiguousarray(forward_sum.reshape(-1, 1))
 
         return {
-            "past_prices": torch.FloatTensor(np.array(past_prices_list)),
-            "current_prices": torch.FloatTensor(np.array(current_prices_list)),
-            "macro_factors": torch.FloatTensor(np.array(macro_list)),
-            "actual_returns": torch.FloatTensor(
-                np.array(actual_returns_list)
-            ).unsqueeze(1),
+            "past_prices": torch.FloatTensor(past_prices),
+            "current_prices": torch.FloatTensor(current_prices),
+            "macro_factors": torch.FloatTensor(macro_factors),
+            "actual_returns": torch.FloatTensor(actual_returns),
         }
