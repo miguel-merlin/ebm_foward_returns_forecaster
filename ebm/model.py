@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
+import time
 from typing import Dict, Tuple, List, Any
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from tqdm.auto import tqdm
@@ -290,7 +291,9 @@ def evaluate_model(
     batch_size: int = 256,
 ) -> Dict[str, Any]:
     """Compute prediction/energy metrics for a dataset."""
+    eval_start = time.perf_counter()
     y_true = data["actual_returns"].detach().cpu().numpy().reshape(-1)
+    optimize_start = time.perf_counter()
     y_pred, y_ci, pred_energy, true_energy = optimize_predictions_in_batches(
         model=model,
         data=data,
@@ -299,6 +302,8 @@ def evaluate_model(
         optimization_lr=optimization_lr,
         batch_size=batch_size,
     )
+    optimize_seconds = time.perf_counter() - optimize_start
+    metrics_start = time.perf_counter()
 
     residuals = y_true - y_pred
     mse = mean_squared_error(y_true, y_pred)
@@ -328,6 +333,8 @@ def evaluate_model(
         "pred_ci_mean": float(np.mean(y_ci)),
         "pred_ci_std": float(np.std(y_ci)),
     }
+    metrics_seconds = time.perf_counter() - metrics_start
+    eval_seconds = time.perf_counter() - eval_start
 
     return {
         "metrics": metrics,
@@ -337,6 +344,11 @@ def evaluate_model(
         "y_ci": y_ci,
         "pred_energy": pred_energy,
         "true_energy": true_energy,
+        "timings": {
+            "eval_total_seconds": float(eval_seconds),
+            "eval_optimization_seconds": float(optimize_seconds),
+            "eval_metrics_seconds": float(metrics_seconds),
+        },
     }
 
 
@@ -357,7 +369,13 @@ def train_energy_model(
     trial: Any = None,
 ) -> List[Dict[str, float]]:
     """Train the energy-based model and return per-epoch metrics."""
+    heartbeat_every = 5
+    trial_id = (
+        f"{trial.number:04d}" if trial is not None and hasattr(trial, "number") else "N/A"
+    )
+    train_start = time.perf_counter()
 
+    transfer_start = time.perf_counter()
     model = model.to(device)
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
@@ -365,6 +383,10 @@ def train_energy_model(
     train_data_device = {key: val.to(device) for key, val in train_data.items()}
     val_data_device = (
         {key: val.to(device) for key, val in val_data.items()} if val_data else None
+    )
+    transfer_seconds = time.perf_counter() - transfer_start
+    print(
+        f"[trial {trial_id}] data transfer complete | seconds={transfer_seconds:.2f}"
     )
 
     n_samples = train_data_device["past_prices"].shape[0]
@@ -377,12 +399,14 @@ def train_energy_model(
     )
     epoch_pbar = tqdm(range(n_epochs), desc=epoch_desc, unit="epoch", leave=False)
     for epoch in epoch_pbar:
+        epoch_start = time.perf_counter()
         model.train()
         epoch_loss = 0.0
         n_batches = 0
 
         indices = torch.randperm(n_samples)  # Mini-batch training
 
+        train_loop_start = time.perf_counter()
         for i in range(0, n_samples, batch_size):
             batch_indices = indices[i : i + batch_size]
 
@@ -405,6 +429,7 @@ def train_energy_model(
 
             epoch_loss += loss.item()
             n_batches += 1
+        train_epoch_seconds = time.perf_counter() - train_loop_start
 
         scheduler.step()
 
@@ -417,6 +442,7 @@ def train_energy_model(
         }
 
         if val_data_device:
+            validation_start = time.perf_counter()
             eval_out = evaluate_model(
                 model=model,
                 data=val_data_device,
@@ -425,14 +451,25 @@ def train_energy_model(
                 optimization_lr=eval_optimization_lr,
                 batch_size=batch_size,
             )
+            validation_seconds = time.perf_counter() - validation_start
             for metric_name, metric_val in eval_out["metrics"].items():
                 epoch_result[f"val_{metric_name}"] = float(metric_val)
+            epoch_result["validation_seconds"] = float(validation_seconds)
+            epoch_result["eval_optimization_seconds"] = float(
+                eval_out["timings"]["eval_optimization_seconds"]
+            )
+            epoch_result["eval_metrics_seconds"] = float(
+                eval_out["timings"]["eval_metrics_seconds"]
+            )
 
             if trial is not None:
                 trial.report(eval_out["metrics"]["rmse"], step=epoch + 1)
                 if trial.should_prune():
                     raise TrialPrunedSignal()
 
+        epoch_seconds = time.perf_counter() - epoch_start
+        epoch_result["train_epoch_seconds"] = float(train_epoch_seconds)
+        epoch_result["epoch_total_seconds"] = float(epoch_seconds)
         history.append(epoch_result)
 
         tqdm_postfix = {
@@ -442,6 +479,25 @@ def train_energy_model(
         val_rmse = epoch_result.get("val_rmse")
         if val_rmse is not None:
             tqdm_postfix["val_rmse"] = f"{val_rmse:.6f}"
+        tqdm_postfix["train_s"] = f"{train_epoch_seconds:.2f}"
+        if "validation_seconds" in epoch_result:
+            tqdm_postfix["val_s"] = f"{epoch_result['validation_seconds']:.2f}"
+        if "eval_optimization_seconds" in epoch_result:
+            tqdm_postfix["eval_opt_s"] = (
+                f"{epoch_result['eval_optimization_seconds']:.2f}"
+            )
         epoch_pbar.set_postfix(tqdm_postfix)
+        if ((epoch + 1) % heartbeat_every == 0) or (epoch + 1 == n_epochs):
+            val_rmse_str = (
+                f"{float(val_rmse):.6f}" if val_rmse is not None else "N/A"
+            )
+            print(
+                f"[trial {trial_id}] heartbeat | epoch={epoch + 1}/{n_epochs} "
+                f"| elapsed={time.perf_counter() - train_start:.2f}s "
+                f"| train_s={train_epoch_seconds:.2f} "
+                f"| val_s={float(epoch_result.get('validation_seconds', 0.0)):.2f} "
+                f"| eval_opt_s={float(epoch_result.get('eval_optimization_seconds', 0.0)):.2f} "
+                f"| val_rmse={val_rmse_str}"
+            )
 
     return history

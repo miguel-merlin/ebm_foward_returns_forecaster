@@ -39,6 +39,7 @@ def build_objective(
     output_dir: Path,
 ):
     def objective(trial: optuna.Trial) -> float:
+        trial_start = time.perf_counter()
         print(f"[trial {trial.number:04d}] Starting hyperparameter sampling")
         trial_dir = output_dir / f"trial_{trial.number:04d}"
         trial_dir.mkdir(parents=True, exist_ok=True)
@@ -90,6 +91,7 @@ def build_objective(
             mlflow.log_params(to_mlflow_params(params, prefix="trial."))
 
             try:
+                train_start = time.perf_counter()
                 history = train_energy_model(
                     model=model,
                     train_data=train_data,
@@ -106,14 +108,25 @@ def build_objective(
                     device=device,
                     trial=trial,
                 )
+                train_seconds = time.perf_counter() - train_start
+                print(
+                    f"[trial {trial.number:04d}] section timing | "
+                    f"train_total_seconds={train_seconds:.2f}"
+                )
             except TrialPrunedSignal:
                 print(f"[trial {trial.number:04d}] Pruned by Optuna")
                 mlflow.set_tag("trial_state", "PRUNED")
                 raise optuna.exceptions.TrialPruned()
 
+            artifacts_start = time.perf_counter()
             history_df = pd.DataFrame(history)
             history_df.to_csv(trial_dir / "epoch_metrics.csv", index=False)
             save_training_plots(history_df, trial_dir / "training_curves.png")
+            artifacts_seconds = time.perf_counter() - artifacts_start
+            print(
+                f"[trial {trial.number:04d}] section timing | "
+                f"artifacts_write_seconds={artifacts_seconds:.2f}"
+            )
 
             if "val_rmse" not in history_df.columns:
                 raise RuntimeError(
@@ -124,6 +137,7 @@ def build_objective(
             best_epoch = int(history_df.loc[best_idx, "epoch"])  # type: ignore
             best_val_rmse = float(history_df.loc[best_idx, "val_rmse"])  # type: ignore
 
+            val_eval_start = time.perf_counter()
             val_eval = evaluate_model(
                 model=model,
                 data=val_data,
@@ -132,6 +146,13 @@ def build_objective(
                 optimization_lr=params["eval_optimization_lr"],
                 batch_size=params["batch_size"],
             )
+            val_eval_seconds = time.perf_counter() - val_eval_start
+            print(
+                f"[trial {trial.number:04d}] section timing | "
+                f"validation_eval_seconds={val_eval_seconds:.2f} | "
+                f"validation_eval_opt_seconds={val_eval['timings']['eval_optimization_seconds']:.2f}"
+            )
+            test_eval_start = time.perf_counter()
             test_eval = evaluate_model(
                 model=model,
                 data=test_data,
@@ -139,6 +160,12 @@ def build_objective(
                 optimization_iterations=params["eval_optimization_iterations"],
                 optimization_lr=params["eval_optimization_lr"],
                 batch_size=params["batch_size"],
+            )
+            test_eval_seconds = time.perf_counter() - test_eval_start
+            print(
+                f"[trial {trial.number:04d}] section timing | "
+                f"test_eval_seconds={test_eval_seconds:.2f} | "
+                f"test_eval_opt_seconds={test_eval['timings']['eval_optimization_seconds']:.2f}"
             )
 
             save_prediction_plots(val_eval, "Validation", trial_dir)
@@ -175,6 +202,18 @@ def build_objective(
 
             mlflow.log_metric("best_val_rmse", best_val_rmse)
             mlflow.log_metric("best_epoch", float(best_epoch))
+            mlflow.log_metric("train_total_seconds", train_seconds)
+            mlflow.log_metric("artifacts_write_seconds", artifacts_seconds)
+            mlflow.log_metric("validation_eval_seconds", val_eval_seconds)
+            mlflow.log_metric(
+                "validation_eval_optimization_seconds",
+                float(val_eval["timings"]["eval_optimization_seconds"]),
+            )
+            mlflow.log_metric("test_eval_seconds", test_eval_seconds)
+            mlflow.log_metric(
+                "test_eval_optimization_seconds",
+                float(test_eval["timings"]["eval_optimization_seconds"]),
+            )
             for metric_name, metric_value in val_eval["metrics"].items():
                 mlflow.log_metric(f"val_{metric_name}", float(metric_value))
             for metric_name, metric_value in test_eval["metrics"].items():
@@ -184,7 +223,8 @@ def build_objective(
             print(
                 f"[trial {trial.number:04d}] Complete | best_val_rmse={best_val_rmse:.6f} "
                 f"| best_epoch={best_epoch} | val_rmse={val_eval['metrics']['rmse']:.6f} "
-                f"| test_rmse={test_eval['metrics']['rmse']:.6f}"
+                f"| test_rmse={test_eval['metrics']['rmse']:.6f} "
+                f"| trial_total_seconds={time.perf_counter() - trial_start:.2f}"
             )
 
             return best_val_rmse
@@ -197,7 +237,7 @@ def parse_args() -> argparse.Namespace:
         description="Long-running EBM training with Optuna HPO and per-trial artifacts."
     )
     parser.add_argument("--n-trials", type=int, default=40)
-    parser.add_argument("--epochs", type=int, default=120)
+    parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--lookback", type=int, default=60)
     parser.add_argument("--forward-horizon", type=int, default=5)
     parser.add_argument("--train-ratio", type=float, default=0.70)
