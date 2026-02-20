@@ -24,7 +24,7 @@ class DataLoader:
             dfs.append(df[["Close"]].rename(columns={"Close": etf_name}))
 
         combined = pd.concat(dfs, axis=1)
-        return combined.fillna(method="ffill")
+        return combined.ffill()
 
     def load_macro_data(self) -> pd.DataFrame:
         """Load macro indicators"""
@@ -36,7 +36,7 @@ class DataLoader:
             dfs.append(df)
 
         combined = pd.concat(dfs, axis=1)
-        return combined.fillna(method="ffill")
+        return combined.ffill()
 
     def prepare_training_data(
         self,
@@ -51,12 +51,34 @@ class DataLoader:
         Returns:
             Dictionary with past_prices, current_prices, macro_factors, actual_returns
         """
+        etf_data = etf_data.copy()
+        macro_data = macro_data.copy()
+
+        # Coerce to DatetimeIndex, strip timezone, and normalize to daily granularity.
+        etf_idx = pd.DatetimeIndex(pd.to_datetime(etf_data.index, errors="coerce"))
+        macro_idx = pd.DatetimeIndex(pd.to_datetime(macro_data.index, errors="coerce"))
+        if etf_idx.tz is not None:
+            etf_idx = etf_idx.tz_localize(None)
+        if macro_idx.tz is not None:
+            macro_idx = macro_idx.tz_localize(None)
+        etf_data.index = etf_idx.normalize()
+        macro_data.index = macro_idx.normalize()
+
         common_dates = etf_data.index.intersection(macro_data.index)
+        if len(common_dates) == 0:
+            raise ValueError(
+                "No overlapping dates between ETF and macro datasets after index alignment."
+            )
         etf_aligned = etf_data.loc[common_dates]
         macro_aligned = macro_data.loc[common_dates]
 
         etf_returns = etf_aligned.pct_change().fillna(0)
-        macro_normalized = (macro_aligned - macro_aligned.mean()) / macro_aligned.std()
+        macro_clean = macro_aligned.ffill().bfill()
+        macro_std = macro_clean.std(ddof=0).replace(0, 1.0)
+        macro_normalized = (macro_clean - macro_clean.mean()) / macro_std
+        macro_normalized = (
+            macro_normalized.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        )
 
         past_prices_list = []
         current_prices_list = []
