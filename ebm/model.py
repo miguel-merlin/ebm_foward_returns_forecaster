@@ -428,8 +428,18 @@ def train_energy_model(
 
         history.append(epoch_result)
 
-        print(
-            f"Epoch {epoch+1}/{n_epochs} | Loss: {avg_loss:.4f} | LR: {scheduler.get_last_lr()[0]:.6f}"
-        )
+        val_rmse = epoch_result.get("val_rmse")
+        val_mae = epoch_result.get("val_mae")
+        if val_rmse is not None and val_mae is not None:
+            print(
+                f"Epoch {epoch+1}/{n_epochs} | train_loss={avg_loss:.4f} "
+                f"| val_rmse={val_rmse:.6f} | val_mae={val_mae:.6f} "
+                f"| lr={scheduler.get_last_lr()[0]:.6f}"
+            )
+        else:
+            print(
+                f"Epoch {epoch+1}/{n_epochs} | train_loss={avg_loss:.4f} "
+                f"| lr={scheduler.get_last_lr()[0]:.6f}"
+            )
 
     return history

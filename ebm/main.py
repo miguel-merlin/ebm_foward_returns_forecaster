@@ -37,6 +37,7 @@ def build_objective(
     output_dir: Path,
 ):
     def objective(trial: optuna.Trial) -> float:
+        print(f"[trial {trial.number:04d}] Starting hyperparameter sampling")
         trial_dir = output_dir / f"trial_{trial.number:04d}"
         trial_dir.mkdir(parents=True, exist_ok=True)
 
@@ -77,6 +78,10 @@ def build_objective(
             use_layernorm=params["use_layernorm"],
         )
         with mlflow.start_run(run_name=f"trial_{trial.number:04d}", nested=True):
+            print(
+                f"[trial {trial.number:04d}] Run started | artifact_dir={trial_dir} "
+                f"| params={params}"
+            )
             mlflow.log_param("trial_number", trial.number)
             mlflow.log_param("optuna_study", trial.study.study_name)
             mlflow.log_params(to_mlflow_params(trial.params, prefix="optuna."))
@@ -100,6 +105,7 @@ def build_objective(
                     trial=trial,
                 )
             except TrialPrunedSignal:
+                print(f"[trial {trial.number:04d}] Pruned by Optuna")
                 mlflow.set_tag("trial_state", "PRUNED")
                 raise optuna.exceptions.TrialPruned()
 
@@ -173,6 +179,11 @@ def build_objective(
                 mlflow.log_metric(f"test_{metric_name}", float(metric_value))
             mlflow.set_tag("trial_state", "COMPLETE")
             mlflow.log_artifacts(str(trial_dir), artifact_path="trial_artifacts")
+            print(
+                f"[trial {trial.number:04d}] Complete | best_val_rmse={best_val_rmse:.6f} "
+                f"| best_epoch={best_epoch} | val_rmse={val_eval['metrics']['rmse']:.6f} "
+                f"| test_rmse={test_eval['metrics']['rmse']:.6f}"
+            )
 
             return best_val_rmse
 
@@ -193,7 +204,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--study-name", type=str, default="ebm_hpo")
     parser.add_argument("--timeout", type=int, default=None)
     parser.add_argument("--output-dir", type=str, default="runs/optuna")
-    parser.add_argument("--mlflow-tracking-uri", type=str, default="file:./runs/mlflow")
+    parser.add_argument(
+        "--mlflow-tracking-uri",
+        type=str,
+        default="sqlite:///runs/mlflow/mlflow.db",
+    )
     parser.add_argument("--mlflow-experiment", type=str, default="returns_ebm")
     parser.add_argument(
         "--device", type=str, default="auto", choices=["auto", "cuda", "cpu"]
@@ -237,6 +252,12 @@ def main() -> None:
         f"val: {val_data['past_prices'].shape[0]}, "
         f"test: {test_data['past_prices'].shape[0]}"
     )
+    print(
+        "Feature shapes -> "
+        f"past_prices: {tuple(train_data['past_prices'].shape)}, "
+        f"current_prices: {tuple(train_data['current_prices'].shape)}, "
+        f"macro_factors: {tuple(train_data['macro_factors'].shape)}"
+    )
 
     output_dir = Path(args.output_dir) / args.study_name
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -246,8 +267,19 @@ def main() -> None:
     run_config["timestamp_utc"] = datetime.utcnow().isoformat()
     (output_dir / "run_config.json").write_text(json.dumps(run_config, indent=2))
 
+    if args.mlflow_tracking_uri.startswith("sqlite:///"):
+        raw_path = args.mlflow_tracking_uri[len("sqlite:///") :]
+        if raw_path:
+            db_path = Path(f"/{raw_path}") if args.mlflow_tracking_uri.startswith("sqlite:////") else Path(raw_path)
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+
     mlflow.set_tracking_uri(args.mlflow_tracking_uri)
     mlflow.set_experiment(args.mlflow_experiment)
+    print(
+        "MLflow configured -> "
+        f"tracking_uri: {args.mlflow_tracking_uri}, "
+        f"experiment: {args.mlflow_experiment}"
+    )
 
     sampler = optuna.samplers.TPESampler(seed=args.seed)
     pruner = optuna.pruners.MedianPruner(n_warmup_steps=10)
@@ -256,6 +288,11 @@ def main() -> None:
         direction="minimize",
         sampler=sampler,
         pruner=pruner,
+    )
+    print(
+        "Optuna configured -> "
+        f"study={args.study_name}, sampler={sampler.__class__.__name__}, "
+        f"pruner={pruner.__class__.__name__}, output_dir={output_dir}"
     )
 
     objective = build_objective(

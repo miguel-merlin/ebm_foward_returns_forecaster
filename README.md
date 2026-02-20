@@ -24,16 +24,41 @@ python3 ebm/main.py \
   --epochs 200 \
   --study-name ebm_long_gpu_run \
   --output-dir runs/optuna \
-  --mlflow-tracking-uri file:./runs/mlflow \
+  --mlflow-tracking-uri sqlite:///runs/mlflow/mlflow.db \
   --mlflow-experiment returns_ebm
 ```
 
 Useful flags:
 
-- `--mlflow-tracking-uri file:./runs/mlflow`: set the MLflow backend store.
+- `--mlflow-tracking-uri sqlite:///runs/mlflow/mlflow.db`: use a SQLite DB backend for MLflow tracking.
 - `--mlflow-experiment returns_ebm`: group runs under an MLflow experiment.
 - `--timeout 86400`: stop optimization after a fixed number of seconds.
 - `--train-ratio 0.70 --val-ratio 0.15`: adjust time-based data splits.
+
+## Start MLflow DB with Docker
+
+Start a PostgreSQL container for MLflow backend storage:
+
+```bash
+./scripts/start_mlflow_db.sh
+```
+
+Then point training to that DB:
+
+```bash
+python3 ebm/main.py \
+  --mlflow-tracking-uri postgresql+psycopg2://mlflow:mlflow@localhost:5432/mlflow \
+  --mlflow-experiment returns_ebm
+```
+
+Optional overrides (defaults shown):
+
+- `MLFLOW_DB_CONTAINER=returns-ebm-mlflow-db`
+- `MLFLOW_DB_IMAGE=postgres:16`
+- `MLFLOW_DB_PORT=5432`
+- `MLFLOW_DB_NAME=mlflow`
+- `MLFLOW_DB_USER=mlflow`
+- `MLFLOW_DB_PASSWORD=mlflow`
 
 Artifacts are written under `runs/optuna/<study-name>/`, including:
 
