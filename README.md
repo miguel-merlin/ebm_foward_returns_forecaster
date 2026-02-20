@@ -54,6 +54,7 @@ python3 ebm/main.py \
 Optional overrides (defaults shown):
 
 - `MLFLOW_DB_CONTAINER=returns-ebm-mlflow-db`
+- `MLFLOW_DB_VOLUME=returns-ebm-mlflow-db-data`
 - `MLFLOW_DB_IMAGE=postgres:16`
 - `MLFLOW_DB_PORT=5432`
 - `MLFLOW_DB_NAME=mlflow`

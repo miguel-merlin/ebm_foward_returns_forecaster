@@ -7,10 +7,16 @@ PORT="${MLFLOW_DB_PORT:-5432}"
 DB_NAME="${MLFLOW_DB_NAME:-mlflow}"
 DB_USER="${MLFLOW_DB_USER:-mlflow}"
 DB_PASSWORD="${MLFLOW_DB_PASSWORD:-mlflow}"
+VOLUME_NAME="${MLFLOW_DB_VOLUME:-returns-ebm-mlflow-db-data}"
 
 if ! command -v docker >/dev/null 2>&1; then
   echo "Error: docker is not installed or not in PATH."
   exit 1
+fi
+
+if ! docker volume ls --format '{{.Name}}' | grep -Fxq "${VOLUME_NAME}"; then
+  echo "Creating Docker volume '${VOLUME_NAME}'..."
+  docker volume create "${VOLUME_NAME}" >/dev/null
 fi
 
 if docker ps -a --format '{{.Names}}' | grep -Fxq "${CONTAINER_NAME}"; then
@@ -28,6 +34,7 @@ else
     -e POSTGRES_USER="${DB_USER}" \
     -e POSTGRES_PASSWORD="${DB_PASSWORD}" \
     -p "${PORT}:5432" \
+    -v "${VOLUME_NAME}:/var/lib/postgresql/data" \
     --health-cmd "pg_isready -U ${DB_USER} -d ${DB_NAME}" \
     --health-interval 2s \
     --health-timeout 3s \
@@ -53,5 +60,6 @@ if [ "${final_status}" != "healthy" ]; then
 fi
 
 echo "Database is ready."
+echo "Docker volume: ${VOLUME_NAME}"
 echo "MLflow tracking URI:"
 echo "postgresql+psycopg2://${DB_USER}:${DB_PASSWORD}@localhost:${PORT}/${DB_NAME}"
